@@ -5,6 +5,7 @@ import json
 import random
 import time
 import torch
+from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
@@ -134,7 +135,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, returnTensor=False):
 
     H, W, focal = hwf
 
@@ -149,13 +150,18 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
-        print(i, time.time() - t)
+        # print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
-        rgbs.append(rgb.cpu().numpy())
-        disps.append(disp.cpu().numpy())
-        if i==0:
-            print(rgb.shape, disp.shape)
+        
+        if returnTensor:
+            rgbs.append(rgb)
+            disps.append(disp)
+        else:
+            rgbs.append(rgb.cpu().numpy())
+            disps.append(disp.cpu().numpy())
+        # if i==0:
+        #     print(rgb.shape, disp.shape)
 
         """
         if gt_imgs is not None and render_factor==0:
@@ -164,13 +170,19 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         """
 
         if savedir is not None:
-            rgb8 = to8b(rgbs[-1])
+            if returnTensor:
+                rgb8 = to8b(rgb.cpu().numpy())
+            else:
+                rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
 
-
-    rgbs = np.stack(rgbs, 0)
-    disps = np.stack(disps, 0)
+    if returnTensor:
+        rgbs = torch.stack(rgbs)
+        disps = torch.stack(disps)
+    else:
+        rgbs = np.stack(rgbs, 0)
+        disps = np.stack(disps, 0)
 
     return rgbs, disps
 
@@ -636,6 +648,11 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    # create tensor board writer
+    tensorBoardWriter = SummaryWriter(
+        log_dir=os.path.join(basedir, expname)
+    )
+
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
@@ -820,13 +837,24 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                test_rgbs, _ = render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, returnTensor=True)
+                
+                # tensor board writer log
+                test_img_loss = img2mse(test_rgbs, torch.from_numpy(images[i_test]).to(test_rgbs.device))
+                test_loss = test_img_loss
+                test_psnr = mse2psnr(test_img_loss)
+                tensorBoardWriter.add_scalar(f"test/loss", test_loss, global_step)
+                tensorBoardWriter.add_scalar(f"test/psnr", test_psnr, global_step)
             print('Saved test set')
 
 
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+
+            # tensor board writer log
+            tensorBoardWriter.add_scalar(f"train/loss", loss, global_step)
+            tensorBoardWriter.add_scalar(f"train/psnr", psnr, global_step)
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
