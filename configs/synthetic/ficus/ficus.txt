@@ -1,9 +1,9 @@
-expname = blender_paper_ship
+expname = blender_paper_ficus
 basedir = ./logs
-datadir = ./data/nerf_synthetic/ship
+datadir = ./data/nerf_synthetic/ficus
 dataset_type = blender
 
-no_batching = True
+no_batching = False
 
 use_viewdirs = True
 white_bkgd = True

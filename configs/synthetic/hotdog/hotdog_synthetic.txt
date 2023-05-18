@@ -1,9 +1,9 @@
-expname = blender_paper_ficus
+expname = blender_paper_hotdog
 basedir = ./logs
-datadir = ./data/nerf_synthetic/ficus
+datadir = ./data/nerf_synthetic/hotdog
 dataset_type = blender
 
-no_batching = True
+no_batching = False
 
 use_viewdirs = True
 white_bkgd = True

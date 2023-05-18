@@ -1,9 +1,9 @@
-expname = blender_paper_mic
+expname = blender_paper_ship
 basedir = ./logs
-datadir = ./data/nerf_synthetic/mic
+datadir = ./data/nerf_synthetic/ship
 dataset_type = blender
 
-no_batching = True
+no_batching = False
 
 use_viewdirs = True
 white_bkgd = True

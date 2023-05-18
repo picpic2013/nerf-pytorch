@@ -1,0 +1,44 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }, {
+            "name": "train_lego.py",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run_nerf.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--config", "configs/synthetic/lego/lego_greedy.txt", 
+                // "--config", "configs/lego_no_batching.txt", 
+                // "--ft_path", "logs/blender_paper_lego/030000.tar", 
+                // "--active_learning", "true", 
+                "--active_learning_start_num_batch", "20", 
+                // "--active_learning_similarity_threshold", "0.7", 
+                "--i_testset", "1000", 
+                // "--i_testset", "40", 
+                // "--expname", "blender_paper_lego_no_batching_rand_idx", 
+                "--expname", "blender_paper_lego_test_2", 
+                // "--active_learning_img_mask_strategy", "true", 
+                // "--n_iters", "1000", 
+                "--N_rand", "300"
+                // "--N_rand", "150"
+                // "--no_batching"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}${pathSeparator}${env:PYTHONPATH}",
+                "CUDA_VISIBLE_DEVICES": "7"
+            },
+            "justMyCode": true
+        }
+    ]
+}

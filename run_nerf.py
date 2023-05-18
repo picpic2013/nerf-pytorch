@@ -9,6 +9,8 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
+import lpips
+from testutils.utils import compute_ssim
 
 import matplotlib.pyplot as plt
 
@@ -24,6 +26,25 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
 
+# lpips
+lpips_vgg = lpips.LPIPS(net="vgg").eval().to(device)
+
+def multinomial_large_scale(sampling_prob, num_samples, replacement=False):
+    all_idx = []
+    sampling_batch = 16777200 # in torch.multinomial, number of categories cannot exceed 2^24
+    prob_sum = torch.sum(sampling_prob)
+    prob_len = len(sampling_prob)
+    for sampling_begin in range(0, prob_len, sampling_batch):
+        sampling_end = min(sampling_begin + sampling_batch, prob_len)
+        sampling_prob_batch = sampling_prob[sampling_begin:sampling_end]
+        prob_sum_batch = torch.sum(sampling_prob_batch)
+        sampling_num_batch = int(torch.ceil((prob_sum_batch / prob_sum) * num_samples).item())
+        idx_batch = torch.multinomial(sampling_prob_batch, num_samples=sampling_num_batch, replacement=replacement)
+        idx_batch += sampling_begin
+        all_idx.append(idx_batch)
+    all_idx = torch.cat(all_idx)
+    all_idx = all_idx[0:num_samples]
+    return all_idx
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -135,8 +156,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, returnTensor=False):
-
+def render_path_iter(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, returnTensor=False):
     H, W, focal = hwf
 
     if render_factor!=0:
@@ -154,29 +174,23 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         t = time.time()
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         
-        if returnTensor:
-            rgbs.append(rgb)
-            disps.append(disp)
-        else:
-            rgbs.append(rgb.cpu().numpy())
-            disps.append(disp.cpu().numpy())
-        # if i==0:
-        #     print(rgb.shape, disp.shape)
-
-        """
-        if gt_imgs is not None and render_factor==0:
-            p = -10. * np.log10(np.mean(np.square(rgb.cpu().numpy() - gt_imgs[i])))
-            print(p)
-        """
-
         if savedir is not None:
-            if returnTensor:
-                rgb8 = to8b(rgb.cpu().numpy())
-            else:
-                rgb8 = to8b(rgbs[-1])
+            rgb8 = to8b(rgb.cpu().numpy())
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
 
+        if returnTensor:
+            yield rgb, disp
+        else:
+            yield rgb.cpu().numpy(), disp.cpu().numpy()
+
+def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, returnTensor=False):
+    rgbs_disps = render_path_iter(render_poses, hwf, K, chunk, render_kwargs, gt_imgs, savedir, render_factor, returnTensor)
+    rgbs = []
+    disps = []
+    for r, d in rgbs_disps:
+        rgbs.append(r)
+        disps.append(d)
     if returnTensor:
         rgbs = torch.stack(rgbs)
         disps = torch.stack(disps)
@@ -414,7 +428,20 @@ def render_rays(ray_batch,
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+
+    # maxWeightPts = pts[]
+    maxWeightIndex = torch.argmax(weights, dim=1) # B
+    rayIdxArange = torch.arange(maxWeightIndex.size(0), device=maxWeightIndex.device)
+    maxWeightPts = pts[rayIdxArange,maxWeightIndex]
+
+    if lindisp:
+        # you should implement "NDC2world" function
+        # maxWeightPts = NDC2world(maxWeightPts, near=near, far=far)
+        assert False, 'NDC max weight pts not implemented!'
+
+    # tmp = weights.max(dim=1)
+
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'weight_map': weights, 'max_weight_pts': maxWeightPts}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -442,6 +469,8 @@ def config_parser():
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
                         help='input data directory')
+    parser.add_argument("--n_iters", type=int, default=200000, 
+                        help='n iters')
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8, 
@@ -540,6 +569,21 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
 
+    # ucb sampling options
+    parser.add_argument("--active_learning", type=bool, default=False, 
+                        help='use active learning strategy when training')
+    parser.add_argument("--active_learning_start_num_batch", type=int, default=0, 
+                        help='start active learning strategy after such batches')
+    parser.add_argument("--active_learning_similarity_threshold", type=float, default=0.7, 
+                        help='ray similarity threshold of the active learning strategy')
+    parser.add_argument("--active_learning_maintain_rand_sample_info", type=bool, default=False, 
+                        help='maintain ray info when sampling randomly')
+    parser.add_argument("--active_learning_img_mask_strategy", type=bool, default=True, 
+                        help='init ray info by using image alpha mask')
+    parser.add_argument("--active_learning_temprature_ratio", type=float, default=10., 
+                        help='temprature ratio')
+    parser.add_argument("--active_learning_strategy", type=str, default='full', 
+                        help='active learning strategy [ greedy | ucb | full ]')
     return parser
 
 
@@ -580,6 +624,7 @@ def train():
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
+        images_alpha = images[...,-1]
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
@@ -702,7 +747,8 @@ def train():
         rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
-        np.random.shuffle(rays_rgb)
+        # np.random.shuffle(rays_rgb)
+        rand_idx = torch.randperm(rays_rgb.shape[0])
 
         print('done')
         i_batch = 0
@@ -710,68 +756,170 @@ def train():
     # Move training data to GPU
     if use_batching:
         images = torch.Tensor(images).to(device)
-    poses = torch.Tensor(poses).to(device)
-    if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
+        i_train = torch.from_numpy(i_train).to(device)
+    poses = torch.Tensor(poses).to(device)
 
-
-    N_iters = 200000 + 1
+    N_iters = args.n_iters + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
+    print('Active learning strategy available?', args.active_learning)
+    if args.active_learning:
+        print('Active learning strategy is', args.active_learning_strategy)
 
-    # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
+    if args.active_learning:
+        ray_loss = torch.zeros_like(torch.Tensor(images[i_train])[..., 0], device=device)
+        similarity_in_rays = torch.zeros_like(ray_loss, device=ray_loss.device)
+        rays_sampling_cnt = torch.zeros_like(ray_loss, dtype=torch.int32, device=ray_loss.device)
+        rays_outdate_cnt = torch.zeros_like(ray_loss, dtype=torch.int32, device=ray_loss.device)
+
+        if args.active_learning_img_mask_strategy:
+            assert args.dataset_type == 'blender', 'Only implemented on dataset_type = "blender"'
+            images_alpha = torch.from_numpy(images_alpha).to(device)
+            transparrent_mask = images_alpha[i_train] == 0.
+            similarity_in_rays[transparrent_mask] = 1e-8
+
+        if use_batching:
+            images_cuda = images
+        else:
+            images_cuda = torch.Tensor(images).to(device)
+        
+        allIndexs = torch.stack(torch.meshgrid(*[torch.arange(_, device=ray_loss.device) for _ in ray_loss.shape]), dim=-1)
+        
+        all_rays = torch.stack([torch.stack(get_rays(H, W, K, p), dim=-1) for p in poses[i_train,:3,:4]], dim=0).to(ray_loss.device) # [N, ro+rd, H, W, 3]
     
     start = start + 1
+    # loss_mse = None
     for i in trange(start, N_iters):
         time0 = time.time()
 
-        # Sample random ray batch
-        if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+        if args.active_learning and i > args.active_learning_start_num_batch:
+            
+            # TODO: no implementation for model saving and loading
+            assert i > start, 'active learning strategy needs at least one optimization to get necessary information'
+            
+            with torch.no_grad():
 
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                print("Shuffle data after an epoch!")
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                i_batch = 0
+                grid_list = extras['max_weight_pts'] # B x 3
+                ones_append = torch.ones([grid_list.shape[0], 1], device=grid_list.device)
+                grid_list = torch.cat([grid_list, ones_append], dim=1)
+                # w2c = dset.c2w.inverse()
+                intr = torch.Tensor(K, device=grid_list.device)
+                grid_list = grid_list.T
+                pos_in_cam = poses[i_train] @ grid_list
+                pos_in_cam = (pos_in_cam[:, :3, :]).permute([1, 2, 0]).reshape(3, -1)
+                pos_in_img = intr @ pos_in_cam
+                pos_in_img = pos_in_img[:2, :] / pos_in_img[2, :]
+                pos_in_img = pos_in_img.reshape(2, -1, ray_loss.size(0))
+                
+                # uv 
+                pos_in_img[0] = torch.clamp(pos_in_img[0], 0, W - 1)
+                pos_in_img[1] = torch.clamp(pos_in_img[1], 0, H - 1)
+                pos_in_img = torch.round(pos_in_img).long() # 2 x B x V
 
-        else:
-            # Random from one image
-            img_i = np.random.choice(i_train)
-            target = images[img_i]
-            target = torch.Tensor(target).to(device)
-            pose = poses[img_i, :3,:4]
+                pos_in_img_x, pos_in_img_y = pos_in_img.unbind(0) # B x V
+                view_selction_idx = torch.arange(ray_loss.size(0), device=grid_list.device)[None].repeat(pos_in_img.size(1), 1)
+                
+                # calculate grid_similarity
+                gt_grid = images_cuda[view_selction_idx, pos_in_img_x, pos_in_img_y].to(device)
+                gt_ref = target_s[:, None]
+                
+                similar_list = 1 - ((gt_grid - gt_ref) ** 2).sum(dim=-1).sqrt() # MSE, B x V
+                similar_list[similar_list < args.active_learning_similarity_threshold] = 0
+                
+                # init 
+                # if similarity_in_rays is None:
+                #     similarity_in_rays = torch.zeros_like(rays_sampling_cnt, dtype=torch.float, device=grid.links.device)
+                #     ray_loss = torch.zeros_like(dset.ray_loss, device=grid.links.device)
+                #     rays_outdate_cnt = torch.zeros_like(rays_outdate_cnt, device=grid.links.device)
+                
+                # spreaded ray loss 
+                # if loss_mse is None:
+                #     loss_mse = torch.zeros(1, device=device)
+                spread_loss = loss_mse[:, None]
 
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+                # update ray loss
+                idxs = view_selction_idx, pos_in_img_x, pos_in_img_y
+                ray_loss[idxs] = ((spread_loss * similar_list * similar_list + ray_loss[idxs] * similarity_in_rays[idxs]) / (similar_list + similarity_in_rays[idxs] + 1e-30))
+                similarity_in_rays[idxs] = (similarity_in_rays[idxs] * similarity_in_rays[idxs] + similar_list * similar_list) / (similarity_in_rays[idxs] + similar_list + 1e-30)
+                rays_sampling_prob = ray_loss.clone()
+                # batch_ratio = torch.sum(ray_loss > 0) / (args.batch_size * 10)
 
-                if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
-                    coords = torch.stack(
-                        torch.meshgrid(
-                            torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
-                            torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
-                        ), -1)
-                    if i == start:
-                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
+                masked_rays_outdate_cnt = rays_outdate_cnt.clone().double()
+                masked_rays_outdate_cnt[ray_loss <= 0] = 0
+                batch_ratio = torch.sum(ray_loss > 0) / (grid_list.shape[0] * args.active_learning_temprature_ratio) # 
+                masked_rays_outdate_cnt = torch.clamp(masked_rays_outdate_cnt / batch_ratio, max=50) # OOM 
+                
+                if args.active_learning_strategy == 'greedy':
+                    pass
+                elif args.active_learning_strategy == 'ucb':
+                    rays_sampling_prob *= 1 / torch.exp(rays_sampling_cnt + 1e-30)
+                elif args.active_learning_strategy == 'full':
+                    rays_sampling_prob *= (torch.exp(masked_rays_outdate_cnt))
+                    rays_sampling_prob *= 1 / (similarity_in_rays + 1e-8)
                 else:
-                    coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+                    assert False, 'args.active_learning_strategy must be [ greedy | ucb | full ]'                
+                rays_sampling_prob[similarity_in_rays == 0] = 1e30
 
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].long()  # (N_rand, 2)
-                rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)
-                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                # select_inds = torch.multinomial(rays_sampling_prob.view(-1), num_samples=spread_loss.size(0), replacement=False)
+                select_inds = multinomial_large_scale(rays_sampling_prob.view(-1), num_samples=view_selction_idx.size(0), replacement=False)
+                select_coords = allIndexs.view(-1, 3)[select_inds]
+                
+                batch_rays = all_rays.view(-1, 3, 2)[select_inds].permute(2, 0, 1).to(device)
+                target_s = images_cuda[i_train].view(-1, 3)[select_inds].to(device)
+        else:
+            # Sample random ray batch
+            if use_batching:
+
+                # TODO: no implementation for active learning strategy
+                # assert not args.active_learning, f'No implementation for active learning strategy when args.no_batching is {args.no_batching}). '
+
+                # Random over all images
+
+                rand_idx_batch = rand_idx[i_batch:i_batch+N_rand]
+                batch = rays_rgb[rand_idx_batch] # [B, 2+1, 3*?]
+                batch = torch.transpose(batch, 0, 1)
+                batch_rays, target_s = batch[:2], batch[2]
+
+                i_batch += N_rand
+                if i_batch >= rays_rgb.shape[0]:
+                    print("Shuffle data after an epoch!")
+                    rand_idx = torch.randperm(rays_rgb.shape[0])
+                    # rays_rgb = rays_rgb[rand_idx]
+                    i_batch = 0
+
+            else:
+                # Random from one image
+                img_i = np.random.choice(i_train)
+                target = images[img_i]
+                target = torch.Tensor(target).to(device)
+                pose = poses[img_i, :3,:4]
+
+                if N_rand is not None:
+                    rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+
+                    if i < args.precrop_iters:
+                        dH = int(H//2 * args.precrop_frac)
+                        dW = int(W//2 * args.precrop_frac)
+                        coords = torch.stack(
+                            torch.meshgrid(
+                                torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
+                                torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+                            ), -1)
+                        if i == start:
+                            print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
+                    else:
+                        coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+
+                    coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+                    select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+                    select_coords = coords[select_inds].long()  # (N_rand, 2)
+                    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    batch_rays = torch.stack([rays_o, rays_d], 0)
+                    target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
@@ -791,6 +939,38 @@ def train():
 
         loss.backward()
         optimizer.step()
+
+        # if args.active_learning:
+        if args.active_learning and i == args.active_learning_start_num_batch:
+            loss_mse = (rgb - target_s) ** 2
+            loss_mse = loss_mse.mean(dim=-1)
+        if args.active_learning and (args.active_learning_maintain_rand_sample_info or i > args.active_learning_start_num_batch):
+            with torch.no_grad():
+                # calculate ray loss
+                loss_mse = (rgb - target_s) ** 2
+                loss_mse = loss_mse.mean(dim=-1)
+
+                if i > args.active_learning_start_num_batch:
+                    img_i, select_cords_y, select_cords_x = select_coords.unbind(-1)
+                else:
+                    if use_batching:
+                        img_i = torch.div(rand_idx_batch, H * W, rounding_mode='floor')
+                        select_cords_y = torch.div(rand_idx_batch % (H * W), W, rounding_mode='floor')
+                        select_cords_x = rand_idx_batch % W
+                    else:
+                        select_cords_y, select_cords_x = select_coords.unbind(-1)
+
+                # update ray loss
+                ray_loss[img_i, select_cords_y, select_cords_x] = loss_mse
+                if similarity_in_rays is not None:
+                    similarity_in_rays[img_i, select_cords_y, select_cords_x] = 1
+
+                # update rays_sampling_cnt
+                rays_sampling_cnt[img_i, select_cords_y, select_cords_x] += 1
+
+                # update rays_outdate_cnt
+                rays_outdate_cnt += 1
+                rays_outdate_cnt[img_i, select_cords_y, select_cords_x] = 0
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
@@ -837,17 +1017,55 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                test_rgbs, _ = render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, returnTensor=True)
+                # test_rgbs, _ = render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, returnTensor=True)
+                # del _
+
+                # # tensor board writer log
+                # if type(images) == torch.Tensor:
+                #     tmp = images[i_test]
+                # else:
+                #     tmp = torch.Tensor(images[i_test])
+                #     tmp = tmp.to(test_rgbs.device)
+                # test_loss = img2mse(test_rgbs, tmp)
+                # test_psnr = mse2psnr(test_loss)
+
+                # test_ssim = compute_ssim(tmp, test_rgbs).mean()
+
+                # tmp = tmp.permute([0, 3, 1, 2]).contiguous()
+                # test_rgbs = test_rgbs.permute([0, 3, 1, 2]).contiguous()
                 
-                # tensor board writer log
-                test_img_loss = img2mse(test_rgbs, torch.from_numpy(images[i_test]).to(test_rgbs.device))
-                test_loss = test_img_loss
-                test_psnr = mse2psnr(test_img_loss)
+                # test_lpips = 0.
+                # for tmp_i, test_rgb_i in zip(tmp, test_rgbs):
+                #     test_lpips += lpips_vgg(tmp_i, test_rgb_i, normalize=True).mean()
+                # test_lpips /= tmp.size(0)
+
+                test_rgbs_disps = render_path_iter(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir, returnTensor=True)
+                
+                test_loss = 0.
+                test_psnr = 0.
+                test_ssim = 0.
+                test_lpips = 0.
+                for (test_rgb_i, _), gt_img_i in zip(test_rgbs_disps, images[i_test]):
+                    if type(gt_img_i) != torch.Tensor:
+                        gt_img_i = torch.Tensor(gt_img_i).to(device)
+                    test_loss_i = img2mse(test_rgb_i, gt_img_i)
+                    test_loss += test_loss_i
+                    test_psnr += mse2psnr(test_loss_i)
+                    test_ssim += compute_ssim(gt_img_i, test_rgb_i).mean()
+                    test_lpips += lpips_vgg(
+                        gt_img_i.permute(2, 0, 1).contiguous(), test_rgb_i.permute(2, 0, 1).contiguous(), normalize=True
+                    ).mean()
+                
+                test_loss /= int(i_test.shape[0])
+                test_psnr /= int(i_test.shape[0])
+                test_ssim /= int(i_test.shape[0])
+                test_lpips /= int(i_test.shape[0])
+
                 tensorBoardWriter.add_scalar(f"test/loss", test_loss, global_step)
                 tensorBoardWriter.add_scalar(f"test/psnr", test_psnr, global_step)
+                tensorBoardWriter.add_scalar(f"test/ssim", test_ssim, global_step)
+                tensorBoardWriter.add_scalar(f"test/lpips", test_lpips, global_step)
             print('Saved test set')
-
-
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
