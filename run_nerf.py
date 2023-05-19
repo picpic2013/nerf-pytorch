@@ -850,7 +850,7 @@ def train():
                 masked_rays_outdate_cnt = rays_outdate_cnt.clone().double()
                 masked_rays_outdate_cnt[ray_loss <= 0] = 0
                 batch_ratio = torch.sum(ray_loss > 0) / (grid_list.shape[0] * args.active_learning_temprature_ratio) # 
-                masked_rays_outdate_cnt = torch.clamp(masked_rays_outdate_cnt / batch_ratio, max=50) # OOM 
+                masked_rays_outdate_cnt = torch.clamp(masked_rays_outdate_cnt / batch_ratio, max=10) # OOM 
                 
                 if args.active_learning_strategy == 'greedy':
                     pass
