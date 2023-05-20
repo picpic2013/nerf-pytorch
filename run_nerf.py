@@ -38,7 +38,7 @@ def multinomial_large_scale(sampling_prob, num_samples, replacement=False):
     for sampling_begin in range(0, prob_len, sampling_batch):
         sampling_end = min(sampling_begin + sampling_batch, prob_len)
         sampling_prob_batch = sampling_prob[sampling_begin:sampling_end]
-        prob_sum_batch = torch.sum(sampling_prob_batch)
+        prob_sum_batch = torch.sum(sampling_prob_batch) + 1e-30
         sampling_num_batch = int(torch.ceil((prob_sum_batch / prob_sum) * num_samples).item())
         idx_batch = torch.multinomial(sampling_prob_batch, num_samples=sampling_num_batch, replacement=replacement)
         idx_batch += sampling_begin
@@ -74,12 +74,12 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024*32, rand_colors=None, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], rand_colors=rand_colors, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -91,7 +91,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
-                  use_viewdirs=False, c2w_staticcam=None,
+                  use_viewdirs=False, c2w_staticcam=None, rand_colors=None, 
                   **kwargs):
     """Render rays
     Args:
@@ -146,7 +146,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, rand_colors=rand_colors, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -286,7 +286,7 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, rand_colors=None):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -326,8 +326,13 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
 
-    if white_bkgd:
-        rgb_map = rgb_map + (1.-acc_map[...,None])
+    if type(white_bkgd) == bool:
+        white_bkgd = torch.tensor(white_bkgd, device=rgb_map.device).repeat(rgb_map.shape[0])
+
+    if rand_colors is None:
+        rand_colors = torch.ones(rgb_map.shape[0], 3, device=rgb_map.device)
+
+    rgb_map[white_bkgd] = rgb_map[white_bkgd] + rand_colors * (1. - acc_map[...,None][white_bkgd])
 
     return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -344,7 +349,8 @@ def render_rays(ray_batch,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
-                pytest=False):
+                pytest=False, 
+                rand_colors=None):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -410,7 +416,7 @@ def render_rays(ray_batch,
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, rand_colors=rand_colors)
 
     if N_importance > 0:
 
@@ -427,7 +433,7 @@ def render_rays(ray_batch,
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, rand_colors=rand_colors)
 
 
     # maxWeightPts = pts[]
@@ -585,6 +591,12 @@ def config_parser():
                         help='temprature ratio')
     parser.add_argument("--active_learning_strategy", type=str, default='full', 
                         help='active learning strategy [ greedy | ucb | full ]')
+    
+    # flip background color
+    parser.add_argument("--i_flip_bg", type=int, default=None, 
+                        help='flip background color every $i_flip_bg batches, 0 for random bg color in a batch')
+    parser.add_argument("--rand_bg", type=bool, default=False, 
+                        help='use random background color')
     return parser
 
 
@@ -703,6 +715,18 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
 
+    # flip bg
+    assert args.i_flip_bg is None or (args.dataset_type == 'blender'), 'Not Implemented Error'
+    if args.i_flip_bg is not None and args.i_flip_bg == 0:
+        # flip_bg = torch.tensor(args.white_bkgd, device=device).repeat(len(i_train))
+        render_kwargs_train['white_bkgd'] = torch.rand(args.N_rand, device=device) > 0.5
+    else:
+        # render_kwargs_train['white_bkgd'] = args.white_bkgd
+        render_kwargs_train['white_bkgd'] = torch.tensor(args.white_bkgd, device=device).repeat(args.N_rand)
+
+    if args.rand_bg:
+        render_kwargs_train['white_bkgd'] = torch.tensor(args.white_bkgd, device=device).repeat(args.N_rand)
+
     bds_dict = {
         'near' : near,
         'far' : far,
@@ -757,6 +781,7 @@ def train():
     # Move training data to GPU
     if use_batching:
         images = torch.Tensor(images).to(device)
+        images_alpha = torch.Tensor(images_alpha).to(device)
         rays_rgb = torch.Tensor(rays_rgb).to(device)
         i_train = torch.from_numpy(i_train).to(device)
     poses = torch.Tensor(poses).to(device)
@@ -778,7 +803,8 @@ def train():
 
         if args.active_learning_img_mask_strategy:
             assert args.dataset_type == 'blender', 'Only implemented on dataset_type = "blender"'
-            images_alpha = torch.from_numpy(images_alpha).to(device)
+            if type(images_alpha) != torch.Tensor:
+                images_alpha = torch.from_numpy(images_alpha).to(device)
             transparrent_mask = images_alpha[i_train] == 0.
             similarity_in_rays[transparrent_mask] = 1e-8
 
@@ -870,6 +896,15 @@ def train():
                 
                 batch_rays = all_rays.view(-1, 3, 2)[select_inds].permute(2, 0, 1).to(device)
                 target_s = images_cuda[i_train].view(-1, 3)[select_inds].to(device)
+
+                # flip bg
+                if args.i_flip_bg is not None:
+                    target_alpha = images_alpha[i_train].view(-1)[select_inds].to(device).view(-1, 1)
+                    if args.rand_bg:
+                        rand_colors = torch.rand(N_rand, 3, device=device)
+                    else:
+                        rand_colors = torch.ones(N_rand, 3, device=device)
+                    target_s[render_kwargs_train['white_bkgd']] = target_s[render_kwargs_train['white_bkgd']] * target_alpha + rand_colors * (1. - target_alpha)
         else:
             # Sample random ray batch
             if use_batching:
@@ -891,6 +926,15 @@ def train():
                     # rays_rgb = rays_rgb[rand_idx]
                     i_batch = 0
 
+                # flip bg
+                if args.i_flip_bg is not None:
+                    target_alpha = images_alpha[i_train].view(-1)[rand_idx_batch].to(device).view(-1, 1)
+                    if args.rand_bg:
+                        assert args.white_bkgd, 'must use white background'
+                        rand_colors = torch.rand(N_rand, 3, device=device)
+                    else:
+                        rand_colors = torch.ones(N_rand, 3, device=device)
+                    target_s[render_kwargs_train['white_bkgd']] = (target_s * target_alpha + rand_colors * (1. - target_alpha))[render_kwargs_train['white_bkgd']]
             else:
                 # Random from one image
                 img_i = np.random.choice(i_train)
@@ -922,9 +966,18 @@ def train():
                     batch_rays = torch.stack([rays_o, rays_d], 0)
                     target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
+                    # flip bg
+                    if args.i_flip_bg is not None:
+                        target_alpha = images_alpha[i_train].to(device).view(-1, 1)
+                        if args.rand_bg:
+                            rand_colors = torch.rand(N_rand, 3, device=device)
+                        else:
+                            rand_colors = torch.ones(N_rand, 3, device=device)
+                        target_s[render_kwargs_train['white_bkgd']] = target_s[render_kwargs_train['white_bkgd']] * target_alpha + rand_colors * (1. - target_alpha)
+
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
+                                                verbose=i < 10, retraw=True, rand_colors=rand_colors, 
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
@@ -985,6 +1038,13 @@ def train():
         dt = time.time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
+
+        # flip bg
+        if args.i_flip_bg is not None and not args.rand_bg:
+            if args.i_flip_bg == 0:
+                render_kwargs_train['white_bkgd'] = torch.rand(args.N_rand, device=device) > 0.5
+            elif i % args.i_flip_bg == 0 and i != 0:
+                render_kwargs_train['white_bkgd'] = ~render_kwargs_train['white_bkgd']
 
         # Rest is logging
         if i%args.i_weights==0:
